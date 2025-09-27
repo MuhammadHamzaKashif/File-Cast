@@ -3,6 +3,9 @@ from hashlib import sha1
 
 
 # Each packet we sending has certain messages like:
+
+# LIST      : L --- Requests the list of available files the peer is seeding
+# META      : M --- Sends the metadata.json of the selected file
 # HANDSHAKE : H --- Initial msg sent to ensure the peer replies back and exchanges the torrent_id
 # BITFIELD  : B --- Returns the bitfield which is an array of booleans telling which piece of file is present or not
 # REQUEST   : R --- Asks the peer to send a required piece of file
@@ -35,10 +38,63 @@ async def read_msg(reader):
 
 # ==================== Server shii ======================= #
 
-async def handle_peer(reader, writer, metadata, pieces_dir, bitfield):
+async def handle_peer(reader, writer):
     peer_address = writer.get_extra_info('peername') # getting the address (IP:PORT) of the peer
 
     try:
+
+        # List
+
+        typ, payload = await read_msg(reader= reader)
+
+        # Loops through names of all folders in torrents directory
+        # and adds their names and torrent_id in a list
+        # This list is sent back to client
+
+        if typ == b'L':
+
+            available_shii = []
+
+            for shii in os.listdir("torrents"):
+                meta_path = os.path.join("torrents", shii, "metadata.json")
+
+                if os.path.exists(meta_path):
+                    with open(meta_path, 'r') as rf:
+                        shii_metadata = json.load(rf)
+                    available_shii.append({"name": shii_metadata["name"], "torrent_id": shii_metadata["torrent_id"]})
+            payload = json.dumps(available_shii).encode()
+
+            writer.write(pack_msg(b'L', payload))
+            await writer.drain()
+
+        # Meta
+
+        # Gets the required torrent_id from the client
+        # Loops through all the folders in torrent dir
+        # If the torrent_id is matched in metadata of any torrent
+        # Sends that metadata back to client so they can download the file
+
+        typ, payload = await read_msg(reader= reader)
+        metadata = {}
+        if typ == b'M':
+
+            torrent_id = payload.decode()
+
+            for shii in os.listdir("torrents"):
+                meta_path = os.path.join("torrents", shii, "metadata.json")
+
+                if os.path.exists(meta_path):
+
+                    with open(meta_path, 'r') as rf:
+                        shii_metadata = json.load(rf)
+                    
+                    if shii_metadata["torrent_id"] == torrent_id:
+                        metadata = shii_metadata
+                        writer.write(pack_msg(b'M', json.dumps(shii_metadata).encode()))
+                        await writer.drain()
+                        break
+
+
 
         # Handshake
 
@@ -58,14 +114,21 @@ async def handle_peer(reader, writer, metadata, pieces_dir, bitfield):
         writer.write(pack_msg(b'H', metadata["torrent_id"].encode()))
         await writer.drain()
 
-        # Sending Bitfield
-
+        # Getting Bitfield
         n_pieces = len(metadata["pieces"])
+        bitfield = [False] * n_pieces
+        torrent_dir = os.path.join("torrents", f"torrent_{metadata['name']}_{metadata['length']}")
+        pieces_dir = os.path.join(torrent_dir, "pieces")
+        for fname in os.listdir(pieces_dir):
+            if fname.startswith("piece_"):
+                idx = int(fname[6:12])
+                bitfield[idx] = True
+
 
         bitfield_bytes = bytearray((n_pieces + 7) // 8)
 
         for i in range(n_pieces):
-            if bitfield[i]: # checking if that particular (i-th) piece is available
+            if bitfield[i]:         # checking if that particular (i-th) piece is available
                 byte_idx = i // 8   # tells the index of byte like every byte is 8 bits thats why divide by 8
                 bit_idx = i % 8     # tells the index of bit becuase after every 8 bits new byte starts
 
@@ -111,12 +174,9 @@ async def handle_peer(reader, writer, metadata, pieces_dir, bitfield):
 
 
 
-async def start_server_shii(metadata, pieces_dir, bitfield, host, port):
+async def start_server_shii(host, port):
     server = await asyncio.start_server(
-        lambda r, w: handle_peer(r, w, 
-                                 metadata= metadata, 
-                                 pieces_dir= pieces_dir,
-                                 bitfield= bitfield),
+        lambda r, w: handle_peer(r, w),
         host= host,
         port= port
     )
@@ -132,102 +192,179 @@ async def start_server_shii(metadata, pieces_dir, bitfield, host, port):
 
 # ================== Client shii ========================= #
 
-async def download_from_peer(peer_host, peer_port, metadata, bitfield, pieces_dir):
-    n_pieces = len(metadata["pieces"])
+async def download_from_peer(peer_host, peer_port):
 
     reader, writer = await asyncio.open_connection(peer_host, peer_port)
 
-    try:
-        
-        # Handshake
+    metadata = None
+    pieces_dir = None
+    bitfield = []
 
-        writer.write(pack_msg(b'H', metadata["torrent_id"].encode()))
+    try:
+
+        # List
+
+        # Sends L message to peer
+        # (yeah ik L message funny)
+        # (more like L Chu message)
+
+        writer.write(pack_msg(b'L', b''))
         await writer.drain()
 
-        typ, payload = await read_msg(reader= reader)
 
-        if typ != b'H':
+        try:
+            typ, payload = await read_msg(reader)
+
+        except asyncio.IncompleteReadError:
+            print(f"Connection closed by {peer_host}:{peer_port}")
+            return
+
+        if typ != b'L':
+            print(f"No files available from {peer_host}:{peer_port}")
             return
         
-        # Bitfield
-
-        typ, payload = await read_msg(reader= reader)
-
-        if typ != b'B':
-            return
+        available_shii = json.loads(payload.decode())
         
-        peer_bitfield = [False] * n_pieces   # initialize bitfield with all false at start
- 
-        for i in range(n_pieces):
-            byte_idx = i // 8
-            bit_idx = i % 8
+        while True:
+            print("Available files:")
+            print("----------------")
 
-            if byte_idx < len(payload):
-                peer_bitfield[i] = bool(payload[byte_idx] & (1 << bit_idx)) # ok i again dont know whatever shii is going on here
+            for i , shii in enumerate(available_shii):
+                print(f"{i}. {shii['name']} ({shii['torrent_id']})")
+            c = int(input("Enter File Number to Download: "))
+            selected = available_shii[c]
 
-        # Request missing pieces
+            # Meta
 
-        for i in range(n_pieces):
+            # Request metadata of the selected file from peer
 
-            if bitfield[i]: # Piece already present so we skip it
-                continue
-
-            if not peer_bitfield[i]: # Peer does not have the piece
-                continue
-
-            # Request
-
-            writer.write(pack_msg(b'R', struct.pack(">I", i)))
+            writer.write(pack_msg(b'M', selected["torrent_id"].encode()))
             await writer.drain()
-
-            # Piece
 
             typ, payload = await read_msg(reader= reader)
 
-            if typ != b'P':
-                continue
-
-            (recv_idx,) = struct.unpack(">I", payload[:4])
-
-            if recv_idx != i: # Did not receive right piece
-                continue
-
-            piece_data = payload[4:]
-
-            # Saving piece
-
-            piece_path = os.path.join(pieces_dir, f"piece_{i:06d}.bin")
-
-            with open(piece_path, "wb") as f:
-                f.write(piece_data)
+            if typ != b'M':
+                print(f"No metadata received from {peer_host}:{peer_port}...")
+                return
             
-            # Verifying hash of file to check
+            metadata = json.loads(payload.decode())
 
-            expected = metadata["pieces"][i]
+            # Saving metadata
 
-            got = sha1(piece_data).hexdigest()
+            torrent_dir = os.path.join("downloads", metadata["name"])
 
-            if got != expected:
-                print(f"SHA missmatch piece {i}")
-            else:
-                bitfield[i] = True
-                print(f"Downloaded piece {i + 1}/{n_pieces} from {peer_host}:{peer_port}")
+            pieces_dir = os.path.join(torrent_dir, "pieces")
+
+            os.makedirs(pieces_dir, exist_ok= True)
+
+            with open(os.path.join(torrent_dir, "metadata.json"), 'w') as wf:
+                json.dump(metadata, wf, indent= 2)
+
+
+            # Initializing bitfield
+
+            n_pieces = len(metadata["pieces"])
+            bitfield = [False] * n_pieces
+
+            for fname in os.listdir(pieces_dir):
+                if fname.startswith("piece_"):
+                    idx = int(fname[6:12])
+                    bitfield[idx] = True
+
+
+            # Handshake
+
+            writer.write(pack_msg(b'H', metadata["torrent_id"].encode()))
+            await writer.drain()
+
+            typ, payload = await read_msg(reader= reader)
+
+            if typ != b'H':
+                print("Handshake failed...")
+                return
+            
+            # Bitfield
+
+            typ, payload = await read_msg(reader= reader)
+
+            if typ != b'B':
+                print("Did not receive bitfield...")
+                return
+            
+            peer_bitfield = [False] * n_pieces   # initialize bitfield with all false at start
+    
+            for i in range(n_pieces):
+                byte_idx = i // 8
+                bit_idx = i % 8
+
+                if byte_idx < len(payload):
+                    peer_bitfield[i] = bool(payload[byte_idx] & (1 << bit_idx)) # ok i again dont know whatever shii is going on here
+
+            # Request missing pieces
+
+            for i in range(n_pieces):
+
+                if bitfield[i]: # Piece already present so we skip it
+                    continue
+
+                if not peer_bitfield[i]: # Peer does not have the piece
+                    continue
+
+                # Request
+
+                writer.write(pack_msg(b'R', struct.pack(">I", i)))
+                await writer.drain()
+
+                # Piece
+
+                typ, payload = await read_msg(reader= reader)
+
+                if typ != b'P':
+                    continue
+
+                (recv_idx,) = struct.unpack(">I", payload[:4])
+
+                if recv_idx != i: # Did not receive right piece
+                    continue
+
+                piece_data = payload[4:]
+
+                # Saving piece
+
+                piece_path = os.path.join(pieces_dir, f"piece_{i:06d}.bin")
+
+                with open(piece_path, "wb") as f:
+                    f.write(piece_data)
+                
+                # Verifying hash of file to check
+
+                expected = metadata["pieces"][i]
+
+                got = sha1(piece_data).hexdigest()
+
+                if got != expected:
+                    print(f"SHA missmatch piece {i}")
+                else:
+                    bitfield[i] = True
+                    print(f"Downloaded piece {i + 1}/{n_pieces} from {peer_host}:{peer_port}")
 
 
 
-        # Check if we now have all pieces
+            # Check if we now have all pieces
 
-        if all(bitfield):
+            if all(bitfield):
 
-            # Assemble the pieces
+                # Assemble the pieces
 
-            out_file = os.path.join(os.path.dirname(pieces_dir), "downloaded_" + metadata["name"])
-            with open(out_file, "wb") as out:
-                for i in range(len(metadata["pieces"])):
-                    piece_path = os.path.join(pieces_dir, f"piece_{i:06d}.bin")
-                    with open(piece_path, "rb") as pf:
-                        out.write(pf.read())
-            print(f"All pieces downloaded. File assembled at: {out_file}")
+                out_file = os.path.join(os.path.dirname(pieces_dir), "downloaded_" + metadata["name"])
+                with open(out_file, "wb") as out:
+                    for i in range(len(metadata["pieces"])):
+                        piece_path = os.path.join(pieces_dir, f"piece_{i:06d}.bin")
+                        with open(piece_path, "rb") as pf:
+                            out.write(pf.read())
+                print(f"All pieces downloaded. File assembled at: {out_file}")
+                print("**************************************************************")
+                print("**************************************************************")
 
 
     finally:
@@ -238,25 +375,7 @@ async def download_from_peer(peer_host, peer_port, metadata, bitfield, pieces_di
 
 # =========================== Main ================================== #
 
-async def main(torrent_dir, port, peers):
-    meta_path = os.path.join(torrent_dir, "metadata.json")
-    pieces_dir = os.path.join(torrent_dir, "pieces")
-    os.makedirs(pieces_dir, exist_ok= True)
-
-    # reading torrent metadata
-
-    with open(meta_path, "r") as f:
-        metadata = json.load(f)
-
-    n_pieces = len(metadata["pieces"])
-    bitfield = [False] * n_pieces   # initializing bitfield
-
-    # Marking already existing pieces
-
-    for fname in os.listdir(pieces_dir):
-        if fname.startswith("piece_"):
-            idx = int(fname[6:12])
-            bitfield[idx] = True
+async def main(port, peers):
 
     host = "0.0.0.0"
 
@@ -264,9 +383,6 @@ async def main(torrent_dir, port, peers):
 
     server_task = asyncio.create_task(
         start_server_shii(
-            metadata= metadata,
-            pieces_dir= pieces_dir,
-            bitfield= bitfield,
             host= host,
             port= port
         )
@@ -285,10 +401,7 @@ async def main(torrent_dir, port, peers):
         client_tasks.append(
             download_from_peer(
                 peer_host= phost,
-                peer_port= int(pport),
-                metadata= metadata,
-                bitfield= bitfield,
-                pieces_dir= pieces_dir
+                peer_port= int(pport)
             )
             )
         
@@ -300,8 +413,8 @@ async def main(torrent_dir, port, peers):
 
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--torrent", required= True)
     parser.add_argument("--port", default= 6881, type= int)
     parser.add_argument("--peers", default= "", help= "Comma separated host:port")
 
@@ -309,5 +422,6 @@ if __name__ == "__main__":
 
     peers = [x for x in args.peers.split(",") if x]
 
-    asyncio.run(main(args.torrent, args.port, peers))
+    asyncio.run(main(args.port, peers))
+
 

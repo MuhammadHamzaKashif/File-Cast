@@ -3,13 +3,27 @@ import sys
 import json
 from hashlib import sha1
 
+
+
+# Divides a file into pieces
+
+# We give the req piece size
+# Reads bits according to piece size, hashes them
+# Makes files of each piece and writes the data
+# The hashed data is stored in the metadata.json
+
+# Metadata.json is the description of the torrent
+# When we need to download this we will first get the metdata
+# So that we get the hash pieces and torrent_id
+
+
 def make_pieces(file_path, piece_size= 262144):
     base_name = os.path.basename(file_path)
     size = os.path.getsize(file_path)
     torent_id_hasher = sha1()
     pieces = []
 
-    out_dir = f"torrent_{base_name}_{size}"
+    out_dir = f"torrents/torrent_{base_name}_{size}"
     pieces_dir = os.path.join(out_dir, "pieces")
 
     os.makedirs(pieces_dir, exist_ok=True)
@@ -22,10 +36,15 @@ def make_pieces(file_path, piece_size= 262144):
             if not data:
                 break
 
+            # Hashing
+
             h = sha1(data).hexdigest()
             pieces.append(h)
             torent_id_hasher.update(bytes.fromhex(h))
             piece_name = os.path.join(pieces_dir, f"piece_{i:06d}.bin")
+
+
+            # Creating pieces
 
             with open(piece_name, "wb") as pf:
                 pf.write(data)
@@ -33,6 +52,9 @@ def make_pieces(file_path, piece_size= 262144):
 
 
     torent_id = torent_id_hasher.hexdigest()
+
+
+    # Makin metadata
 
     metadata = {
         "name": base_name,
@@ -53,6 +75,9 @@ def make_pieces(file_path, piece_size= 262144):
 
     return out_dir
 
+
+# sys.argv takes the arguments we provide at command line and use them in program
+# Here file_path and piece_size are used in make_pieces()
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
